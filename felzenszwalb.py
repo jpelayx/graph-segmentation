@@ -150,6 +150,7 @@ def save_gif(segments,  int_diffs, sizes, img, path):
 if __name__ == '__main__':
     import argparse 
     import os
+    from datetime import datetime
 
     parser = argparse.ArgumentParser()
     parser.add_argument('-f', '--filename', type=str, default='out.gif')
@@ -186,6 +187,8 @@ if __name__ == '__main__':
     segments = []
     int_diffs = []
     sizes = []
+
+    print('started @ ', str(datetime.now()))
     for idx in range(len(edge_queue)):
         edge_idx = edge_queue[idx]
         w = edge_weights[edge_idx]
@@ -209,4 +212,4 @@ if __name__ == '__main__':
         out_path = os.path.join(drive_path, filename)
     else: 
         out_path = filename
-    save_gif(segments, int_diffs, sizes, out_path)
+    save_gif(segments, int_diffs, sizes, img, out_path)
