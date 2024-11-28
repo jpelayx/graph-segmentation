@@ -1,108 +1,134 @@
 using SparseArrays
 using GraphNeuralNetworks
-using NNlib: σ
+using NNlib: σ, tanh, tanh_fast
 
 import Images
+import Graphs
 
-function initialize_structures(N::Int) 
-    S = Vector{SparseVector{Float64, Int64}}(undef, N) 
-    segment_hash = Dict{Int64, Set{Int64}}(zip(1:N, Set([i]) for i in 1:N))
-    segment_size = ones(Float64, N)
-    internal_diff = zeros(Float64, N)
-    for i in 1:N
-        S[i] = sparsevec([i], [1.0], N)
-    end
-    return S, segment_hash, segment_size, internal_diff
+get_segments(S::SparseMatrixCSC{Float64, Int64}, cs::AbstractVector) = @view S[:, cs]
+
+function get_segments_from_vertices(S::SparseMatrixCSC{Float64, Int64}, vi::Int) 
+     get_segments(S, S[vi,:].nzind), S[vi,:].nzind
 end
 
-get_segments(S::Vector{SparseVector{Float64, Int64}}, cs::AbstractVector) = @view S[cs]
+adjust_u!(C_off, C, u) = C_off[u] *= C[u]
+adjust_v!(C_off, v) = C_off[v] = 0.0
 
-get_segments_from_vertices(S::Vector{SparseVector{Float64, Int64}}, vi::Int) = @inbounds [c for c in 1:length(S) if S[c][vi] > 0.0]
+notC(C, I) = sparsevec(
+    vcat(I, rowvals(C[I])), 
+    vcat(ones(Float64, length(I)), -nonzeros(C[I])), 
+    N
+)
 
-function get_segments_from_vertices(S::Vector{SparseVector{Float64, Int64}}, segment_hash::Dict{Int64, Vector{Int64}}, vi::Int) 
-    V_I = @inbounds segment_hash[vi]
-    V_K = [S[i][vi] for i in V_I]
-    return V_I, V_K
-end
-
-function get_segments_from_vertices(S::Vector{SparseVector{Float64, Int64}}, segment_hash::Dict{Int64, Set{Int64}}, vi::Int) 
-    V_I = @inbounds collect(segment_hash[vi])
-    V_K = [S[i][vi] for i in V_I]
-    return V_I, V_K
-end
-
-adjust_offset!(C, C_off, u) = C_off[u] *= C[u]
-
-not(C) = dropzeros(sparsevec(C.nzind, 1 .- C.nzval, N))
-spmult(A, B) = sparsevec(cat(A.nzind, B.nzind, dims=1), cat(A.nzval, B.nzval, dims=1), N, *)
-
-function add_to_segment_hash!(segment::Int, C::SparseVector{Float64, Int64})
-    for i in C.nzind
-        push!(segment_hash[i], segment)
-    end
-end
-
-function  remove_from_segment_hash!(segment::Int, C::SparseVector{Float64, Int64}, C_new::SparseVector{Float64, Int64})
-    for i in setdiff(C.nzind, C_new.nzind)    
-        delete!(segment_hash[i], segment)
-    end
-end
+multsp(A, B) = A .* B
 
 function merge_segments!(
-    S::Vector{SparseVector{Float64, Int64}}, 
-    segment_hash::Dict{Int64, Set{Int64}}, 
-    segment_size::Vector{Float64}, 
-    internal_diff::Vector{Float64}, 
-    P::Matrix{Float64}, w::Float64, 
-    V_I, U_I,
-    u, v
+    S, segment_size, internal_diff, 
+    P, V, V_I, U, U_I, v, u, w
 )
-    Ci = @view S[V_I]
-    Cj = @view S[U_I]
+    Ci = eachcol(V)
+    Cj = eachcol(U)
 
-    Cj_off = -Cj .* sum(P, dims=2)
-    adjust_offset!.(Cj, Cj_off, U_I)
+    Cj_off = Cj .* sum(P, dims=2)
+    adjust_u!.(Cj_off, Cj, u)
 
-    Ci_off = spmult.(not.(Ci), [sum(col .* Cj) for col in eachcol(P)])
+    get_offset(MtoC) = sparsevec(vcat(rowvals.(Cj)...), vcat(MtoC .* nonzeros.(Cj)...), N)
+    toCi = get_offset.(eachcol(P))
+    notCi = notC.(Ci, rowvals.(toCi))
+    Ci_off = multsp.(notCi, toCi)
+    adjust_v!.(Ci_off, v)
 
     Mi = sum(P, dims=1)'
     internal_diff[V_I] = (1 .- Mi) .* internal_diff[V_I] + Mi .* w
-    
     segment_size[V_I] .+= [sum(col .* segment_size[U_I]) for col in eachcol(P)]
 
-    S[V_I] .+= Ci_off
-    S[U_I] .+= Cj_off
-
-    add_to_segment_hash!.(V_I, Ci_off)
-    remove_from_segment_hash!.(U_I, Cj_off, S[U_I])
+    Ci .+= Ci_off
+    Cj .-= Cj_off 
 end
 
-function merge_probability(Vi_I, Vi_K, Vj_I, Vj_K, internal_diff,segment_size, w, k)
+function merge_probability(
+    V_I, V, U_I, U, 
+    internal_diff, 
+    segment_size, 
+    v, u, w, 
+    k, μ = 2.0
+)
     τ(V_I, k) = k./segment_size[V_I]
     MInt = minimum.(
-        Iterators.product(internal_diff[Vj_I] .+ τ(Vj_I, k), 
-                          internal_diff[Vi_I] .+ τ(Vi_I, k)))
-    Mij_conditional = σ.(MInt .- w)
-    Mij = Mij_conditional .* (Vj_K * Vi_K')
+        Iterators.product(internal_diff[U_I] .+ τ(U_I, k), 
+                          internal_diff[V_I] .+ τ(V_I, k)))
+    Mij_conditional = tanh_fast.((MInt .- w) .* μ)
+
+    intersections = V_I ∩ U_I
+    for absolute_index in intersections
+        i = findfirst(x -> x == absolute_index, V_I)
+        j = findfirst(x -> x == absolute_index, U_I)
+        Mij_conditional[j,i] = 0.0
+    end
+    V_K = nonzeros(V[v,:])
+    U_K = nonzeros(U[u,:])
+    Mij = max.(Mij_conditional .* (U_K * V_K'), 0.0)
     return Mij
+end
+
+function compute_edge_weights(g::GNNGraph)
+    src, dst = edge_index(g)
+    x_dim = size(g.x, 1)
+
+    w = @views sum(abs.(g.x[:, src] .- g.x[:, dst]), dims=1) ./ x_dim
+
+    return w
+end
+
+function felzenszwalb(g::GNNGraph; tol=1e-6, μ=1.0, k=1.5)
+    edge_weights = compute_edge_weights(g)
+    sorted_edges = sortperm(edge_weights, dims=1)
+    src, dst = edge_index(g)
+    E = length(sorted_edges)
+    N = g.num_nodes
+
+    Is = [i for i in 1:N]
+    Vs = [1.0 for _ in 1:N]
+    S = sparse(Is, Is, Vs, N, N)
+
+    segment_size = ones(Float64, N)
+    internal_diff = zeros(Float64, N)
+
+    for edge_num in 1:E
+        if edge_num % 100 == 0
+            println("Edge $edge_num/$E")
+        end
+
+        i = sorted_edges[edge_num]
+        v, u = src[i], dst[i]
+        w = g.e[i]
+        V, V_I = get_segments_from_vertices(S, v)
+        U, U_I = get_segments_from_vertices(S, u)
+        P = merge_probability(V_I, V, U_I, U, internal_diff, segment_size, v, u, w, k, μ)
+        merge_segments!(S, segment_size, internal_diff, P, V, V_I, U, U_I, v, u, w)
+        droptol!(S, tol::Float64)
+    end
+
+    return S
 end
 
 function rag(dims::Tuple{Int, Int})
     pixel_index(x, y, width) = (y-1)*width + x
 
     neighbor_offsets = [
-        (-1, 0), (1, 0),  # Left and right
-        (0, -1), (0, 1),  # Up and down
-        (-1, -1), (1, -1),  # Diagonal up-left and up-right
-        (-1, 1), (1, 1)   # Diagonal down-left and down-right
+        (1, 0),  # right
+        (-1, 1),
+        (0, 1),
+        (1, 1)   # Diagonal down-left and down-right
     ]
     
     N = dims[1]*dims[2]
-    E = 8*N - 6*(dims[1] + dims[2]) + 4
+    E = Int(4*N - 3*(dims[1] + dims[2]) + 2)
+    # E = 2*N - dims[1] - dims[2]
     src, dst = Vector{Int64}(undef, E), Vector{Int64}(undef, E)
 
     edge_index = 1
-    @inbounds for y in 1:dims[1]
+    for y in 1:dims[1]
         for x in 1:dims[2]
             current_pixel = pixel_index(x, y, dims[2])
             for (dx, dy) in neighbor_offsets
@@ -120,15 +146,12 @@ function rag(dims::Tuple{Int, Int})
     return GNNGraph(src, dst, num_nodes=N)
 end
 
-
-function compute_edge_weights(g::GNNGraph)
-    src, dst = edge_index(g)
-    x_dim = size(g.x, 1)
-
-    w = @views sum(abs.(g.x[:, src] .- g.x[:, dst]), dims=1) ./ x_dim
-
-    return w
+function rag(dims:: Tuple{Int, Int})
+    grid = Graphs.grid(dims)
+    return to_unidirected(GNNGraph(grid))
 end
+
+
 
 function rag_from_image(img)
     dims = size(img)
@@ -140,30 +163,79 @@ function rag_from_image(img)
     return g
 end
 
-function felzenszwalb(g::GNNGraph)
-    sorted_edges = sortperm(g.e', dims=1)
-    src, dst = edge_index(g)
-
-    for i in sorted_edges
-        v, u = src[i], dst[i]
-        w = g.e[i]
-        V_I, V_K = get_segments_from_vertices(S, segment_hash, v)
-        U_I, U_K = get_segments_from_vertices(S, segment_hash, u)
-        P = merge_probability(V_I, V_K, U_I, U_K, internal_diff, segment_size, w, 300/255)
-        merge_segments!(S, segment_hash, segment_size, internal_diff, P, w, V_I, U_I, u, v)
-    end
-end
-
-function load_sample_image()
-    img = Images.load("data/astronaut.png")
+function load_sample_image(img_path="data/astronaut.png", dims=(32,32))
+    img = Images.load(img_path)
     img = Images.RGB.(img)
-    img = Images.imresize(img, (128, 128))
-    return img, (128, 128)
+    img = Images.imresize(img, dims)
+    return img
 end
 
-img, dims = load_sample_image()
-N = dims[1]*dims[2]
-g = rag_from_image(img)
-S, segment_hash, segment_size, internal_diff = initialize_structures(N)
+function save_masked_image(dims, S, path="data/result_mask.png")
+    segments = argmax.(eachrow(S))
+    segments = reshape(segments, dims)
+    unique_segments = unique(segments)
+    color_map = Dict([(seg, Images.ColorTypes.RGB(rand(), rand(), rand())) for seg in unique_segments])
+    mask = [color_map[seg] for seg in segments]
+    mask = reshape(mask, dims)
+    Images.save(path, mask)    
+end
 
-felzenszwalb(g)
+print("Running...")
+dims = (5, 5)
+img = load_sample_image("data/black_circle.jpg", dims)
+print(" Image loaded...")
+g = rag_from_image(img)
+print(" Graph created")
+
+
+edge_weights = compute_edge_weights(g)
+sorted_edges = sortperm(edge_weights, dims=1)
+src, dst = edge_index(g)
+E = length(sorted_edges)
+N = g.num_nodes
+
+Is = [i for i in 1:N]
+Vs = [1.0 for i in 1:N]
+S = sparse(Is, Is, Vs, N, N)
+
+segment_size = ones(Float64, N)
+internal_diff = zeros(Float64, N)
+
+function loop(edge_num)
+    i = sorted_edges[edge_num]
+    v, u = src[i], dst[i]
+    w = g.e[i]
+
+    V, V_I = get_segments_from_vertices(S, v)
+    U, U_I = get_segments_from_vertices(S, u)
+    @assert all([v in rowvals(C) for C in eachcol(V)])
+    @assert all([u in rowvals(C) for C in eachcol(U)])
+    
+    P = merge_probability(V_I, V, U_I, U, internal_diff, segment_size, v, u, w, k)
+    try
+        @assert all(P .>= 0.0)
+        @assert all(P .<= 1.0)
+    catch e
+        println(e)
+        println(P)
+    end
+    
+    merge_segments!(S, segment_size, internal_diff, P, V, V_I, U, U_I, v, u, w)
+    try
+        @assert isapprox(sum(S[v,:]), 1.0)
+    catch e
+        # println(e)
+        # println(S[v,:])
+        # println()
+    end
+    try
+        @assert isapprox(sum(S[u,:]), 1.0)
+    catch e
+        # println(e)
+        # println(S[u,:])
+        # println()
+    end
+    
+    droptol!(S, 0.001)
+    return v, u, V, V_I, U, U_I, P
+end
