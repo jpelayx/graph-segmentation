@@ -1,6 +1,7 @@
 using SparseArrays
 using GraphNeuralNetworks
 using NNlib: σ, tanh, tanh_fast
+using Statistics
 
 import Images
 import Graphs
@@ -14,17 +15,12 @@ end
 adjust_u!(C_off, C, u) = C_off[u] *= C[u]
 adjust_v!(C_off, v) = C_off[v] = 0.0
 
-notC(C, I) = sparsevec(
-    vcat(I, rowvals(C[I])), 
-    vcat(ones(Float64, length(I)), -nonzeros(C[I])), 
-    N
-)
 
 multsp(A, B) = A .* B
 
 function merge_segments!(
     S, segment_size, internal_diff, 
-    P, V, V_I, U, U_I, v, u, w
+    P, V, V_I, U, U_I, v, u, w, N
 )
     Ci = eachcol(V)
     Cj = eachcol(U)
@@ -33,6 +29,11 @@ function merge_segments!(
     adjust_u!.(Cj_off, Cj, u)
 
     get_offset(MtoC) = sparsevec(vcat(rowvals.(Cj)...), vcat(MtoC .* nonzeros.(Cj)...), N)
+    notC(C, I) = sparsevec(
+        vcat(I, rowvals(C[I])), 
+        vcat(ones(Float64, length(I)), -nonzeros(C[I])), 
+        N
+    )
     toCi = get_offset.(eachcol(P))
     notCi = notC.(Ci, rowvals.(toCi))
     Ci_off = multsp.(notCi, toCi)
@@ -51,7 +52,7 @@ function merge_probability(
     internal_diff, 
     segment_size, 
     v, u, w, 
-    k, μ = 2.0
+    k, μ = 2.0, min_prob=1e-2
 )
     τ(V_I, k) = k./segment_size[V_I]
     MInt = minimum.(
@@ -68,21 +69,18 @@ function merge_probability(
     V_K = nonzeros(V[v,:])
     U_K = nonzeros(U[u,:])
     Mij = max.(Mij_conditional .* (U_K * V_K'), 0.0)
+    Mij[Mij .< min_prob] .= 0.0
     return Mij
 end
 
 function compute_edge_weights(g::GNNGraph)
     src, dst = edge_index(g)
-    x_dim = size(g.x, 1)
-
-    w = @views sum(abs.(g.x[:, src] .- g.x[:, dst]), dims=1) ./ x_dim
-
-    return w
+    w = mean(abs.(g.x[:, src] .- g.x[:, dst]), dims=1)
 end
 
 function felzenszwalb(g::GNNGraph; tol=1e-6, μ=1.0, k=1.5)
     edge_weights = compute_edge_weights(g)
-    sorted_edges = sortperm(edge_weights, dims=1)
+    sorted_edges = sortperm(edge_weights, dims=2)
     src, dst = edge_index(g)
     E = length(sorted_edges)
     N = g.num_nodes
@@ -95,20 +93,15 @@ function felzenszwalb(g::GNNGraph; tol=1e-6, μ=1.0, k=1.5)
     internal_diff = zeros(Float64, N)
 
     for edge_num in 1:E
-        if edge_num % 100 == 0
-            println("Edge $edge_num/$E")
-        end
-
         i = sorted_edges[edge_num]
         v, u = src[i], dst[i]
         w = g.e[i]
         V, V_I = get_segments_from_vertices(S, v)
         U, U_I = get_segments_from_vertices(S, u)
         P = merge_probability(V_I, V, U_I, U, internal_diff, segment_size, v, u, w, k, μ)
-        merge_segments!(S, segment_size, internal_diff, P, V, V_I, U, U_I, v, u, w)
-        droptol!(S, tol::Float64)
+        merge_segments!(S, segment_size, internal_diff, P, V, V_I, U, U_I, v, u, w, N)
+        droptol!(S, tol)
     end
-
     return S
 end
 
@@ -151,14 +144,12 @@ function rag(dims:: Tuple{Int, Int})
     return to_unidirected(GNNGraph(grid))
 end
 
-
-
 function rag_from_image(img)
     dims = size(img)
     g = rag(dims)
     x = Images.channelview(img)
     x = reshape(x, (3, dims[1]*dims[2]))
-    g.ndata.x = x
+    g.ndata.x = Float64.(x)
     g.edata.e = compute_edge_weights(g)
     return g
 end
@@ -180,16 +171,13 @@ function save_masked_image(dims, S, path="data/result_mask.png")
     Images.save(path, mask)    
 end
 
-print("Running...")
-dims = (5, 5)
-img = load_sample_image("data/black_circle.jpg", dims)
-print(" Image loaded...")
-g = rag_from_image(img)
-print(" Graph created")
+dims = (16,16)
+image = load_sample_image("data/astronaut.png", dims)
+g = rag_from_image(image)
 
 
 edge_weights = compute_edge_weights(g)
-sorted_edges = sortperm(edge_weights, dims=1)
+sorted_edges = sortperm(edge_weights, dims=2)
 src, dst = edge_index(g)
 E = length(sorted_edges)
 N = g.num_nodes
@@ -201,17 +189,22 @@ S = sparse(Is, Is, Vs, N, N)
 segment_size = ones(Float64, N)
 internal_diff = zeros(Float64, N)
 
-function loop(edge_num)
+edge_num = 1
+function loop(;k=100, μ=1.0, tol=1e-6)
+    global  edge_num
+    print("Edge $edge_num/$E: ")
+
     i = sorted_edges[edge_num]
     v, u = src[i], dst[i]
     w = g.e[i]
+    println("v: $v, u: $u, w: $w")
 
     V, V_I = get_segments_from_vertices(S, v)
     U, U_I = get_segments_from_vertices(S, u)
     @assert all([v in rowvals(C) for C in eachcol(V)])
     @assert all([u in rowvals(C) for C in eachcol(U)])
     
-    P = merge_probability(V_I, V, U_I, U, internal_diff, segment_size, v, u, w, k)
+    P = merge_probability(V_I, V, U_I, U, internal_diff, segment_size, v, u, w, k, μ)
     try
         @assert all(P .>= 0.0)
         @assert all(P .<= 1.0)
@@ -220,7 +213,8 @@ function loop(edge_num)
         println(P)
     end
     
-    merge_segments!(S, segment_size, internal_diff, P, V, V_I, U, U_I, v, u, w)
+    merge_segments!(S, segment_size, internal_diff, P, V, V_I, U, U_I, v, u, w,N)
+    edge_num += 1
     try
         @assert isapprox(sum(S[v,:]), 1.0)
     catch e
@@ -236,6 +230,6 @@ function loop(edge_num)
         # println()
     end
     
-    droptol!(S, 0.001)
+    droptol!(S, tol)
     return v, u, V, V_I, U, U_I, P
 end
