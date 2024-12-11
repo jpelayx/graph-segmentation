@@ -93,6 +93,9 @@ function felzenszwalb(g::GNNGraph; tol=1e-6, μ=1.0, k=1.5)
     internal_diff = zeros(Float64, N)
 
     for edge_num in 1:E
+        if edge_num % 100 == 0
+            println("Edge $edge_num/$E")
+        end
         i = sorted_edges[edge_num]
         v, u = src[i], dst[i]
         w = g.e[i]
@@ -171,7 +174,7 @@ function save_masked_image(dims, S, path="data/result_mask.png")
     Images.save(path, mask)    
 end
 
-dims = (16,16)
+dims = (28, 28)
 image = load_sample_image("data/astronaut.png", dims)
 g = rag_from_image(image)
 

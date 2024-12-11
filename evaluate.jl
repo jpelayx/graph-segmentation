@@ -15,39 +15,6 @@ function compute_edge_weights(g::GNNGraph)
     w = mean(sqrt.((g.x[:, src] .- g.x[:, dst]).^2), dims=1)
 end
 
-function rag(dims::Tuple{Int, Int})
-    pixel_index(x, y, width) = (y-1)*width + x
-
-    neighbor_offsets = [
-        (1, 0),  # right
-        (-1, 1),
-        (0, 1),
-        (1, 1)   # Diagonal down-left and down-right
-    ]
-    
-    N = dims[1]*dims[2]
-    E = Int(4*N - 3*(dims[1] + dims[2]) + 2)
-    # E = 2*N - dims[1] - dims[2]
-    src, dst = Vector{Int64}(undef, E), Vector{Int64}(undef, E)
-
-    edge_index = 1
-    for y in 1:dims[1]
-        for x in 1:dims[2]
-            current_pixel = pixel_index(x, y, dims[2])
-            for (dx, dy) in neighbor_offsets
-                nx, ny = x + dx, y + dy
-                if 1 <= nx <= dims[2] && 1 <= ny <= dims[1]
-                    neighbor_pixel = pixel_index(nx, ny, dims[2])
-                    src[edge_index] = current_pixel
-                    dst[edge_index] = neighbor_pixel
-                    edge_index += 1
-                end
-            end
-        end
-    end
-         
-    return GNNGraph(src, dst, num_nodes=N)
-end
 
 function rag(dims:: Tuple{Int, Int})
     grid = Graphs.grid(dims)
@@ -81,7 +48,7 @@ function save_masked_image(dims, S, path="data/result_mask.png")
     Images.save(path, mask)    
 end
 
-dims = (128, 128)
+dims = (16,16)
 image = load_sample_image("data/astronaut.png", dims)
 g = rag_from_image(image)
 
