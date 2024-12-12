@@ -4,9 +4,9 @@ This is the NODE-like implementation of the Felzenszwalb algorithm.
 
 using Zygote
 using Zygote: @adjoint
-using SparseArrays
 using GraphNeuralNetworks
 using NNlib: σ, tanh, tanh_fast
+using LinearAlgebra
 
 """
 d/dt h(t) = f(h(t), t, θ)
@@ -42,7 +42,7 @@ end
         js = indexin(intersections, Ui)
         δP[js, is] .= 0.0
     end
-    return (δP, Δ[2], Δ[3])
+    return (δP, nothing, nothing)
 end
 
 function merge_probability(
@@ -51,53 +51,59 @@ function merge_probability(
     segment_size,
     v, u, weight
 )
-    τ(V_I, k) = k ./ segment_size[V_I]
+    τ(Vi, k) = k ./ segment_size[Vi]
     MInt = minimum.(
         Iterators.product(internal_diff[Ui] .+ τ(Ui, k),
-                          internal_diff[Vi] .+ τ(Vi, k)))
+            internal_diff[Vi] .+ τ(Vi, k)))
     Mij_conditional = tanh_fast.((MInt .- weight) .* μ)
 
     if !isempty(Vi ∩ Ui)
         clear_intersections!(Mij_conditional, Vi, Ui)
     end
 
-    V_K = nonzeros(V[v, :])
-    U_K = nonzeros(U[u, :])
-    Mij = max.(Mij_conditional .* (U_K * V_K'), 0.0)
+    Mij = max.(Mij_conditional .* (U[u] * V[v]'), 0.0)
     return Mij
+end
+
+function adjust_u!(dU, U, i) 
+    dU[i, :] .*= U[i, :]
+    return dU
+end 
+
+@adjoint adjust_u!(dU, U, i) = adjust_u!(dU, U, i), Δ -> begin
+    δdU = Δ[1]
+    δU = zeros(size(δdU))
+    δU[i,:] .= dU[i,:] .* Δ[1][i,:]
+    δdU[i,:] .*= U[i,:]
+    return (δdU, δU, nothing)
+end
+
+function adjust_v!(dV, i) 
+    dV[i,:] .= 0.0
+    return dV
+end
+
+@adjoint adjust_v!(dV, i) = adjust_v!(dV, i), Δ -> begin
+    δdV = Δ[1]
+    δdV[i] .= 0.0
+    return (δdV, nothing)
 end
 
 function f(S, internal_diff, segment_size, t, w, E)
     weight = w[t]
     v, u = E[t]
-    Vi = S[v, :].nzind
-    Ui = S[u, :].nzind
+    Vi = findall(x -> x > min_prob, S[v, :])
+    Ui = findall(x -> x > min_prob, S[u, :])
     V = @view S[:, Vi]
     U = @view S[:, Ui]
 
     P = merge_probability(Vi, V, Ui, U, internal_diff, segment_size, v, u, weight)
 
-    V, U = eachcol(V), eachcol(U)
+    dU = S[:, Ui] .* sum(P, dims=2)
+    adjust_u!(dU, U, u)
 
-    dU = eachcol(S[:, Ui]) .* sum(P, dims=2)
-    adjust_u!(dUi, Ui, u) = dUi[u] *= Ui[u]
-    adjust_u!.(dU, U, u)
-
-    get_offset(MtoC) = sparsevec(
-        vcat(rowvals.(U)...),
-        vcat(MtoC .* nonzeros.(U)...), S.n
-    )
-
-    notC(C, Ci) = sparsevec(
-        vcat(Ci, rowvals(C[Ci])),
-        vcat(ones(Float64, length(Ci)), -nonzeros(C[Ci])),
-        S.n
-    )
-    merged_to_V = get_offset.(eachcol(P))
-    notV = notC.(V, rowvals.(merged_to_V))
-    dV = multsp.(notV, merged_to_V)
-    adjust_v!(dVi, v) = dVi[v] = 0.0
-    adjust_v!.(dV, v)
+    dV = (1 .- V) .* (U * P')
+    adjust_v!(dV, v)
 
     dV_I = rowvals.(dV)
     dV_J = fill.(Vi, length.(dV_I))
@@ -111,10 +117,10 @@ function f(S, internal_diff, segment_size, t, w, E)
     )
 
     Mi = sum(P, dims=1)'
-    internal_diff_offset = zeros(S.n)
+    internal_diff_offset = zeros(size(S)[1])
     internal_diff_offset[Vi] = (1 .- Mi) .* internal_diff[Vi] + Mi .* weight
 
-    segment_size_offset = zeros(S.n)
+    segment_size_offset = zeros(size(S)[1])
     segment_size_offset[Vi] .= [sum(col .* segment_size[Ui]) for col in eachcol(P)]
 
     return dS, internal_diff_offset, segment_size_offset
@@ -128,9 +134,9 @@ function felzenszwalb_solve(g::GNNGraph)
     src, dst = src[edge_order], dst[edge_order]
     E = collect(zip(src, dst))
     N = g.num_nodes
-    S = sparse(1:N, 1:N, ones(Float32, N), N, N)
-    internal_diff = zeros(Float32, N)
-    segment_size = ones(Float32, N)
+    S = Matrix{Float64}(I, N, N)
+    internal_diff = zeros(Float64, N)
+    segment_size = ones(Float64, N)
 
     for t in 1:length(E)
         dS, internal_diff_offset, segment_size_offset = f(S, internal_diff, segment_size, t, w, E)
@@ -138,7 +144,6 @@ function felzenszwalb_solve(g::GNNGraph)
         internal_diff += internal_diff_offset
         segment_size += segment_size_offset
 
-        droptol!(S, min_prob)
         if t % 100 == 0
             println("Iteration $t/$(length(E))")
         end
