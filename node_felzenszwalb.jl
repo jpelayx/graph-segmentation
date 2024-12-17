@@ -4,6 +4,7 @@ This is the NODE-like implementation of the Felzenszwalb algorithm.
 
 using Zygote
 using Zygote: @adjoint
+using ChainRules: @ignore_derivatives
 using GraphNeuralNetworks
 using NNlib: σ, tanh, tanh_fast
 using LinearAlgebra
@@ -15,14 +16,8 @@ h(t+1) = h(t) + 1 * f(h(t), t, θ)
 
 k = 25.0
 μ = 3.0
-min_prob = 1e-3
+min_prob = 1e-2
 
-multsp(A, B) = A .* B
-
-get_segments(S::SparseMatrixCSC{Float64,Int64}, cs::AbstractVector) = @view S[:, cs]
-
-get_segments_from_vertices(S::SparseMatrixCSC{Float64,Int64}, vi::Int) =
-    get_segments(S, S[vi, :].nzind), S[vi, :].nzind
 
 function clear_intersections!(P, Vi, Ui)
     intersections = Vi ∩ Ui
@@ -57,7 +52,7 @@ function merge_probability(
             internal_diff[Vi] .+ τ(Vi, k)))
     Mij_conditional = tanh_fast.((MInt .- weight) .* μ)
 
-    if !isempty(Vi ∩ Ui)
+    if @ignore_derivatives !isempty(Vi ∩ Ui)
         clear_intersections!(Mij_conditional, Vi, Ui)
     end
 
@@ -89,6 +84,28 @@ end
     return (δdV, nothing)
 end
 
+function fill_S!(dS, I, dI)
+    dS[:, I] .= dI
+    return dS
+end
+
+@adjoint fill_S!(dS, I, dI) = fill_S!(dS, I, dI), Δ -> begin
+    δdS = Δ[1]
+    δdI = δdS[:, I]
+    return (δdS, nothing, δdI)
+end
+
+function fillvec!(v, I, dI)
+    v[I] .= dI
+    return v
+end
+
+@adjoint fillvec!(v, I, dI) = fillvec!(v, I, dI), Δ -> begin
+    δv = Δ[1]
+    δdI = δv[I]
+    return (δv, nothing, δdI)
+end
+
 function f(S, internal_diff, segment_size, t, w, E)
     weight = w[t]
     v, u = E[t]
@@ -96,32 +113,24 @@ function f(S, internal_diff, segment_size, t, w, E)
     Ui = findall(x -> x > min_prob, S[u, :])
     V = @view S[:, Vi]
     U = @view S[:, Ui]
+    dS = zeros(size(S))
 
     P = merge_probability(Vi, V, Ui, U, internal_diff, segment_size, v, u, weight)
 
-    dU = S[:, Ui] .* sum(P, dims=2)
+    dU = S[:, Ui] .* sum(P, dims=2)'
     adjust_u!(dU, U, u)
+    fill_S!(dS, Ui, -dU)
 
-    dV = (1 .- V) .* (U * P')
+    dV = (1 .- V) .* (U * P)
     adjust_v!(dV, v)
-
-    dV_I = rowvals.(dV)
-    dV_J = fill.(Vi, length.(dV_I))
-    dU_I = rowvals.(dU)
-    dU_J = fill.(Ui, length.(dU_I))
-    dS = sparse(
-        vcat(dV_I..., dU_I...),
-        vcat(dV_J..., dU_J...),
-        vcat(nonzeros.(dV)..., -nonzeros.(dU)...),
-        S.n, S.n
-    )
+    fill_S!(dS, Vi, dV)
 
     Mi = sum(P, dims=1)'
     internal_diff_offset = zeros(size(S)[1])
-    internal_diff_offset[Vi] = (1 .- Mi) .* internal_diff[Vi] + Mi .* weight
+    fillvec!(internal_diff_offset, Vi, (1 .- Mi) .* internal_diff[Vi] .+ Mi .* weight)
 
     segment_size_offset = zeros(size(S)[1])
-    segment_size_offset[Vi] .= [sum(col .* segment_size[Ui]) for col in eachcol(P)]
+    fillvec!(segment_size_offset, Vi, segment_size[Vi] .+ [sum(col .* segment_size[Ui]) for col in eachcol(P)])
 
     return dS, internal_diff_offset, segment_size_offset
 end
@@ -149,4 +158,16 @@ function felzenszwalb_solve(g::GNNGraph)
         end
     end
     return S
+end
+
+function step!(S, internal_diff, segment_size, t)
+    dS, internal_diff_offset, segment_size_offset = f(S, internal_diff, segment_size, t, w, E)
+    S += dS
+    internal_diff += internal_diff_offset
+    segment_size += segment_size_offset
+    
+    @assert all(sum(eachcol(S)) .≈ 1.0)
+    
+
+    return S, internal_diff, segment_size, t+1
 end
