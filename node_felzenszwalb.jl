@@ -2,9 +2,9 @@
 This is the NODE-like implementation of the Felzenszwalb algorithm.
 """
 
-using Zygote
+using ChainRulesCore
+using Zygote 
 using Zygote: @adjoint
-using ChainRules: @ignore_derivatives
 using GraphNeuralNetworks
 using NNlib: σ, tanh, tanh_fast
 using LinearAlgebra
@@ -29,16 +29,20 @@ function clear_intersections!(P, Vi, Ui)
     return P
 end
 
-@adjoint clear_intersections!(P, Vi, Ui) = clear_intersections!(P, Vi, Ui), Δ -> begin
-    δP = Δ[1]
-    intersections = Vi ∩ Ui
-    if !isempty(intersections)
-        is = indexin(intersections, Vi)
-        js = indexin(intersections, Ui)
-        δP[js, is] .= 0.0
+function ChainRulesCore.rrule(::typeof(clear_intersections!), P, Vi, Ui)
+    function pullback(δP)
+        intersections = Vi ∩ Ui
+        if !isempty(intersections)
+            is = indexin(intersections, Vi)
+            js = indexin(intersections, Ui)
+            δP[js, is] .= 0.0
+        end
+        return (NoTangent(), δP, NoTangent(), NoTangent())
     end
-    return (δP, nothing, nothing)
+  
+    return clear_intersections!(P, Vi, Ui), pullback
 end
+
 
 function merge_probability(
     Vi, V, Ui, U,
@@ -65,12 +69,41 @@ function adjust_u!(dU, U, i)
     return dU
 end 
 
-@adjoint adjust_u!(dU, U, i) = adjust_u!(dU, U, i), Δ -> begin
-    δdU = Δ[1]
-    δU = zeros(size(δdU))
-    δU[i,:] .= dU[i,:] .* Δ[1][i,:]
-    δdU[i,:] .*= U[i,:]
-    return (δdU, δU, nothing)
+
+function ChainRulesCore.rrule(::typeof(adjust_u!), dU, U, i)
+    function adjust_u!_pullback(ΔU)
+        ΔU = unthunk(ΔU)
+
+        δU = zeros(size(ΔU))
+        δU[i,:] .= ΔU[i,:] * dU[i,:]
+        
+        δdU = ΔU
+        δdU[i,:] .*= U[i,:]
+        
+        return(NoTangent(), δdU, δU, NoTangent())        
+    end
+    return adjust_u!(dU, U, i), adjust_u!_pullback
+end
+
+function adjust_u(dU, U, i)
+    new_dU = deepcopy(dU)
+    new_dU[i, :] .*= U[i, :]
+    return new_dU
+end
+
+function ChainRulesCore.rrule(::typeof(adjust_u), dU, U, i)
+    function adjust_u_pullback(ΔdU)
+        ΔdU = unthunk(ΔdU)
+
+        δU = zeros(size(ΔdU))
+        δU[i,:] .= ΔdU[i,:] .* dU[i,:]
+        
+        δdU = ΔdU
+        δdU[i,:] .*= U[i,:]
+        
+        return(NoTangent(), δdU, δU, NoTangent())        
+    end
+    return adjust_u(dU, U, i), adjust_u_pullback
 end
 
 function adjust_v!(dV, i) 
