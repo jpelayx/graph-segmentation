@@ -12,9 +12,8 @@ include("node_felzenszwalb.jl")
 
 function compute_edge_weights(g::GNNGraph)
     src, dst = edge_index(g)
-    w = mean(sqrt.((g.x[:, src] .- g.x[:, dst]).^2), dims=1)
+    w = mean((g.x[:, src] .- g.x[:, dst]).^2, dims=1)
 end
-
 
 function rag(dims:: Tuple{Int, Int})
     grid = Graphs.grid(dims)
@@ -48,7 +47,7 @@ function save_masked_image(dims, S, path="data/result_mask.png")
     Images.save(path, mask)    
 end
 
-dims = (16,16)
+dims = (16, 16)
 image = load_sample_image("data/astronaut.png", dims)
 g = rag_from_image(image)
 

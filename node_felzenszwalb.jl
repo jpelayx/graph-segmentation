@@ -56,7 +56,7 @@ function merge_probability(
             internal_diff[Vi] .+ τ(Vi, k)))
     Mij_conditional = tanh_fast.((MInt .- weight) .* μ)
 
-    if @ignore_derivatives !isempty(Vi ∩ Ui)
+    if !isempty(Vi ∩ Ui)
         clear_intersections!(Mij_conditional, Vi, Ui)
     end
 
@@ -64,18 +64,18 @@ function merge_probability(
     return Mij
 end
 
+
 function adjust_u!(dU, U, i) 
     dU[i, :] .*= U[i, :]
     return dU
 end 
-
 
 function ChainRulesCore.rrule(::typeof(adjust_u!), dU, U, i)
     function adjust_u!_pullback(ΔU)
         ΔU = unthunk(ΔU)
 
         δU = zeros(size(ΔU))
-        δU[i,:] .= ΔU[i,:] * dU[i,:]
+        δU[i,:] .= ΔU[i,:] .* dU[i,:]
         
         δdU = ΔU
         δdU[i,:] .*= U[i,:]
@@ -85,72 +85,64 @@ function ChainRulesCore.rrule(::typeof(adjust_u!), dU, U, i)
     return adjust_u!(dU, U, i), adjust_u!_pullback
 end
 
-function adjust_u(dU, U, i)
-    new_dU = deepcopy(dU)
-    new_dU[i, :] .*= U[i, :]
-    return new_dU
-end
-
-function ChainRulesCore.rrule(::typeof(adjust_u), dU, U, i)
-    function adjust_u_pullback(ΔdU)
-        ΔdU = unthunk(ΔdU)
-
-        δU = zeros(size(ΔdU))
-        δU[i,:] .= ΔdU[i,:] .* dU[i,:]
-        
-        δdU = ΔdU
-        δdU[i,:] .*= U[i,:]
-        
-        return(NoTangent(), δdU, δU, NoTangent())        
-    end
-    return adjust_u(dU, U, i), adjust_u_pullback
-end
 
 function adjust_v!(dV, i) 
     dV[i,:] .= 0.0
     return dV
 end
 
-@adjoint adjust_v!(dV, i) = adjust_v!(dV, i), Δ -> begin
-    δdV = Δ[1]
-    δdV[i] .= 0.0
-    return (δdV, nothing)
+function ChainRulesCore.rrule(::typeof(adjust_v!), dV, i)
+    function adjust_v!_pullback(ΔV)
+        δV = unthunk(ΔV)
+        δV[i,:] .= 0.0 
+        return (NoTangent(), δV, NoTangent())
+    end
+    return adjust_v!(dV, i), adjust_v!_pullback
 end
 
+
 function fill_S!(dS, I, dI)
-    dS[:, I] .= dI
+    dS[:, I] .+= dI
     return dS
 end
 
-@adjoint fill_S!(dS, I, dI) = fill_S!(dS, I, dI), Δ -> begin
-    δdS = Δ[1]
-    δdI = δdS[:, I]
-    return (δdS, nothing, δdI)
+function ChainRulesCore.rrule(::typeof(fill_S!), dS, I, dI)
+    function fill_S!_pullback(ΔS)
+        δdS = unthunk(ΔS)
+        δdI = δdS[:, I]
+        return (NoTangent(), δdS, NoTangent(), δdI)
+    end
+    return fill_S!(dS, I, dI), fill_S!_pullback    
 end
+
 
 function fillvec!(v, I, dI)
     v[I] .= dI
     return v
 end
 
-@adjoint fillvec!(v, I, dI) = fillvec!(v, I, dI), Δ -> begin
-    δv = Δ[1]
-    δdI = δv[I]
-    return (δv, nothing, δdI)
+function ChainRulesCore.rrule(::typeof(fillvec!), v, I, dI)
+    function fillvec!_pullback(Δ)
+        δv = unthunk(Δ)
+        δdI = δv[I]
+        return (NoTangent(), δv, NoTangent(), δdI)
+    end
+    return fillvec!(v, I, dI), fillvec!_pullback
 end
+
 
 function f(S, internal_diff, segment_size, t, w, E)
     weight = w[t]
     v, u = E[t]
-    Vi = findall(x -> x > min_prob, S[v, :])
-    Ui = findall(x -> x > min_prob, S[u, :])
+    Vi = findall(x -> x > 0.0, S[v, :])
+    Ui = findall(x -> x > 0.0, S[u, :])
     V = @view S[:, Vi]
     U = @view S[:, Ui]
     dS = zeros(size(S))
 
     P = merge_probability(Vi, V, Ui, U, internal_diff, segment_size, v, u, weight)
 
-    dU = S[:, Ui] .* sum(P, dims=2)'
+    dU = S[:, Ui] .* sum(P, dims=1)
     adjust_u!(dU, U, u)
     fill_S!(dS, Ui, -dU)
 
@@ -160,23 +152,35 @@ function f(S, internal_diff, segment_size, t, w, E)
 
     Mi = sum(P, dims=1)'
     internal_diff_offset = zeros(size(S)[1])
-    fillvec!(internal_diff_offset, Vi, (1 .- Mi) .* internal_diff[Vi] .+ Mi .* weight)
+    fillvec!(internal_diff_offset, 
+        Vi, 
+        ((1 .- Mi) .* internal_diff[Vi] .+ Mi .* weight) - internal_diff[Vi]
+    )
 
     segment_size_offset = zeros(size(S)[1])
-    fillvec!(segment_size_offset, Vi, segment_size[Vi] .+ [sum(col .* segment_size[Ui]) for col in eachcol(P)])
+    fillvec!(segment_size_offset, 
+        Vi, 
+        [sum(col .* segment_size[Ui]) for col in eachcol(P)]
+    )
 
     return dS, internal_diff_offset, segment_size_offset
 end
 
 function felzenszwalb_solve(g::GNNGraph)
     src, dst = edge_index(g)
+    
     w = mean(sqrt.((g.x[:, src] .- g.x[:, dst]) .^ 2), dims=1)
     edge_order = sortperm(w, dims=2)
     w = w[edge_order]
-    src, dst = src[edge_order], dst[edge_order]
+
+    src, dst = src[edge_order], dst[edge_order]    
     E = collect(zip(src, dst))
-    N = g.num_nodes
-    S = Matrix{Float64}(I, N, N)
+
+    num_nodes = N = g.num_nodes
+    num_segments = num_nodes 
+    S = Matrix{Float64}(I, num_nodes, num_segments)
+                        #  rows       cols
+    
     internal_diff = zeros(Float64, N)
     segment_size = ones(Float64, N)
 
@@ -189,8 +193,22 @@ function felzenszwalb_solve(g::GNNGraph)
         if t % 100 == 0
             println("Iteration $t/$(length(E))")
         end
+        if any(sum(S, dims=2) .> 1.0)
+            println("Sum of S > 1 at iteration $t")
+            break
+        end
+        if any(S .< 0)
+            println("Negative values in S at iteration $t")
+            break
+        end
     end
     return S
+end
+
+function undo()
+    S -= dS
+    internal_diff -= internal_diff_offset
+    segment_size -= segment_size_offset
 end
 
 function step!(S, internal_diff, segment_size, t)
