@@ -6,7 +6,7 @@ using ChainRulesCore
 using Zygote 
 using Zygote: @adjoint
 using GraphNeuralNetworks
-using NNlib: σ, tanh, tanh_fast
+using NNlib: σ, tanh, tanh_fast, relu
 using LinearAlgebra
 
 """
@@ -56,11 +56,9 @@ function merge_probability(
             internal_diff[Vi] .+ τ(Vi, k)))
     Mij_conditional = tanh_fast.((MInt .- weight) .* μ)
 
-    if !isempty(Vi ∩ Ui)
-        clear_intersections!(Mij_conditional, Vi, Ui)
-    end
+    clear_intersections!(Mij_conditional, Vi, Ui)
 
-    Mij = max.(Mij_conditional .* (U[u] * V[v]'), 0.0)
+    Mij = relu.(Mij_conditional .* (U[u,:] * V[v,:]'))
     return Mij
 end
 
@@ -142,7 +140,7 @@ function f(S, internal_diff, segment_size, t, w, E)
 
     P = merge_probability(Vi, V, Ui, U, internal_diff, segment_size, v, u, weight)
 
-    dU = S[:, Ui] .* sum(P, dims=1)
+    dU = S[:, Ui] * Diagonal(vec(sum(P, dims=2)))
     adjust_u!(dU, U, u)
     fill_S!(dS, Ui, -dU)
 
@@ -189,17 +187,8 @@ function felzenszwalb_solve(g::GNNGraph)
         S += dS
         internal_diff += internal_diff_offset
         segment_size += segment_size_offset
-
         if t % 100 == 0
             println("Iteration $t/$(length(E))")
-        end
-        if any(sum(S, dims=2) .> 1.0)
-            println("Sum of S > 1 at iteration $t")
-            break
-        end
-        if any(S .< 0)
-            println("Negative values in S at iteration $t")
-            break
         end
     end
     return S
