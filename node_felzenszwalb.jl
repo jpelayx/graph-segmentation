@@ -18,6 +18,7 @@ k = 25.0
 μ = 3.0
 min_prob = 1e-2
 
+include("evaluate.jl")
 
 function clear_intersections!(P, Vi, Ui)
     intersections = Vi ∩ Ui
@@ -113,6 +114,23 @@ function ChainRulesCore.rrule(::typeof(fill_S!), dS, I, dI)
     return fill_S!(dS, I, dI), fill_S!_pullback    
 end
 
+function make_dS(dV, Vi, dU, Ui)
+    N = size(dV)[1]
+    dS = zeros(N,N)
+    dS[:, Vi] .= dV
+    dS[:, Ui] .+= dU
+    return dS
+end
+
+function ChainRulesCore.rrule(::typeof(make_dS), dV, Vi, dU, Ui)
+    function make_dS_pullback(Δ)
+        ΔdS = unthunk(Δ)
+        δdV = ΔdS[:, Vi]
+        δdU = ΔdS[:, Ui]
+        return (NoTangent(), δdV, NoTangent(), δdU, NoTangent())
+    end
+    return make_dS(dV, Vi, dU, Ui), make_dS_pullback
+end
 
 function fillvec!(v, I, dI)
     v[I] .= dI
@@ -136,17 +154,16 @@ function f(S, internal_diff, segment_size, t, w, E)
     Ui = findall(x -> x > 0.0, S[u, :])
     V = @view S[:, Vi]
     U = @view S[:, Ui]
-    dS = zeros(size(S))
 
     P = merge_probability(Vi, V, Ui, U, internal_diff, segment_size, v, u, weight)
-
-    dU = S[:, Ui] * Diagonal(vec(sum(P, dims=2)))
+    
+    dU = U * Diagonal(vec(sum(P, dims=2)))
     adjust_u!(dU, U, u)
-    fill_S!(dS, Ui, -dU)
 
     dV = (1 .- V) .* (U * P)
     adjust_v!(dV, v)
-    fill_S!(dS, Vi, dV)
+
+    dS = make_dS(dV, Vi, dU, Ui)
 
     Mi = sum(P, dims=1)'
     internal_diff_offset = zeros(size(S)[1])
@@ -194,11 +211,6 @@ function felzenszwalb_solve(g::GNNGraph)
     return S
 end
 
-function undo()
-    S -= dS
-    internal_diff -= internal_diff_offset
-    segment_size -= segment_size_offset
-end
 
 function step!(S, internal_diff, segment_size, t)
     dS, internal_diff_offset, segment_size_offset = f(S, internal_diff, segment_size, t, w, E)
@@ -211,3 +223,5 @@ function step!(S, internal_diff, segment_size, t)
 
     return S, internal_diff, segment_size, t+1
 end
+
+felzenszwalb_solve(g)

@@ -7,8 +7,6 @@ using GraphNeuralNetworks
 import Images 
 import Graphs
 
-# include("felzenszwalb.jl")
-include("node_felzenszwalb.jl")
 
 function compute_edge_weights(g::GNNGraph)
     src, dst = edge_index(g)
@@ -47,7 +45,7 @@ function save_masked_image(dims, S, path="data/result_mask.png")
     Images.save(path, mask)    
 end
 
-dims = (16, 16)
+dims = (16,16)
 image = load_sample_image("data/astronaut.png", dims)
 g = rag_from_image(image)
 
