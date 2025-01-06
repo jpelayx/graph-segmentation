@@ -163,7 +163,7 @@ function f(S, internal_diff, segment_size, t, w, E)
     dV = (1 .- V) .* (U * P)
     adjust_v!(dV, v)
 
-    dS = make_dS(dV, Vi, dU, Ui)
+    dS = make_dS(dV, Vi, -dU, Ui)
 
     Mi = sum(P, dims=1)'
     internal_diff_offset = zeros(size(S)[1])
@@ -181,17 +181,18 @@ function f(S, internal_diff, segment_size, t, w, E)
     return dS, internal_diff_offset, segment_size_offset
 end
 
-function felzenszwalb_solve(g::GNNGraph)
-    src, dst = edge_index(g)
+# S, segment_hash, segment_size, internal_diff = initialize_structures(N)
+function felzenszwalb_solve(G::GNNGraph)
+    src, dst = edge_index(G)
     
-    w = mean(sqrt.((g.x[:, src] .- g.x[:, dst]) .^ 2), dims=1)
+    w = mean(sqrt.((G.x[:, src] .- G.x[:, dst]) .^ 2), dims=1)
     edge_order = sortperm(w, dims=2)
     w = w[edge_order]
 
     src, dst = src[edge_order], dst[edge_order]    
     E = collect(zip(src, dst))
 
-    num_nodes = N = g.num_nodes
+    num_nodes = N = G.num_nodes
     num_segments = num_nodes 
     S = Matrix{Float64}(I, num_nodes, num_segments)
                         #  rows       cols
@@ -211,6 +212,21 @@ function felzenszwalb_solve(g::GNNGraph)
     return S
 end
 
+function felzenszwalb_reverse(G::GNNGraph, S, Δf)
+    src, dst = edge_index(G)
+    
+    w = mean(sqrt.((G.x[:, src] .- G.x[:, dst]) .^ 2), dims=1)
+    edge_order = sortperm(w, rev=true, dims=2)
+    w = w[edge_order]
+
+    src, dst = src[edge_order], dst[edge_order]    
+    E = collect(zip(src, dst))
+
+    num_nodes = N = G.num_nodes
+    num_segments = num_nodes 
+
+end
+
 
 function step!(S, internal_diff, segment_size, t)
     dS, internal_diff_offset, segment_size_offset = f(S, internal_diff, segment_size, t, w, E)
@@ -224,4 +240,5 @@ function step!(S, internal_diff, segment_size, t)
     return S, internal_diff, segment_size, t+1
 end
 
-felzenszwalb_solve(g)
+S = felzenszwalb_solve(g)
+@assert all(isapprox.(sum.(eachrow(S)), 1.0, atol=5e-1))
