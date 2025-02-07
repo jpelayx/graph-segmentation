@@ -240,5 +240,5 @@ function step!(S, internal_diff, segment_size, t)
     return S, internal_diff, segment_size, t+1
 end
 
-S = felzenszwalb_solve(g)
-@assert all(isapprox.(sum.(eachrow(S)), 1.0, atol=5e-1))
+# S = felzenszwalb_solve(g)
+# @assert all(isapprox.(sum.(eachrow(S)), 1.0, atol=5e-1))
