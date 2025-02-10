@@ -36,7 +36,7 @@ function load_sample_image(img_path="data/astronaut.png", dims=(32,32))
 end
 
 function save_masked_image(dims, S, path="data/result_mask.png")
-    segments = argmax.(eachcol(S))
+    segments = argmax.(eachrow(S))
     segments = reshape(segments, dims)
     unique_segments = unique(segments)
     color_map = Dict([(seg, Images.ColorTypes.RGB(rand(), rand(), rand())) for seg in unique_segments])
@@ -51,7 +51,7 @@ G = rag_from_image(image)
 
 tol = 1e-2
 
-function evaluate(ks, μs, tol)
+function evaluate_hyperparams(ks, μs, tol)
     ks = [0.1,1,5,10,15,25,50,100,150,200,250,500]
     μs = [5,10]
     for (k, μ) in Iterators.product(ks, μs)

@@ -53,9 +53,12 @@ function merge_probability(
 )
     τ(Vi, k) = k ./ segment_size[Vi]
     MInt = minimum.(
-        Iterators.product(internal_diff[Ui] .+ τ(Ui, k),
-            internal_diff[Vi] .+ τ(Vi, k)))
-    Mij_conditional = tanh_fast.((MInt .- weight) .* μ)
+        Iterators.product(
+            internal_diff[Ui] .+ τ(Ui, k),
+            internal_diff[Vi] .+ τ(Vi, k)
+        )
+    )
+    Mij_conditional = tanh.((MInt .- weight) .* μ)
 
     clear_intersections!(Mij_conditional, Vi, Ui)
 
@@ -239,6 +242,3 @@ function step!(S, internal_diff, segment_size, t)
 
     return S, internal_diff, segment_size, t+1
 end
-
-# S = felzenszwalb_solve(g)
-# @assert all(isapprox.(sum.(eachrow(S)), 1.0, atol=5e-1))
