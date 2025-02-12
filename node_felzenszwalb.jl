@@ -22,9 +22,18 @@ min_prob = 1e-2
 
 include("evaluate.jl")
 
+mutable struct Segmentation
+    S::Matrix{Float64}
+    internal_diff::Vector{Float64}
+    segment_size::Vector{Float64}
+end
+
+Segmentation(N::Int) = Segmentation(Matrix{Float64}(I,N,N), zeros(N), ones(N))
+
 struct FelzenszwalbStep 
     t::Int
-    δS::SparseMatrixCSC{Float64, Int}
+    ΔS::SparseMatrixCSC{Float64, Int}
+    ΔInt::SparseVector{Float64, Int}
 end 
 
 struct FelzenszwalbTape 
@@ -33,24 +42,25 @@ end
 
 FelzenszwalbTape() = FelzenszwalbTape(Stack{FelzenszwalbStep}())
 
-function record!(tape::FelzenszwalbTape, δS, t)
-    push!(tape.stack, FelzenszwalbStep(t, sparse(δS)))
+import Base: isempty
+function Base.isempty(tape::FelzenszwalbTape)
+    return isempty(tape.stack)
 end
 
-function apply!(S, tape::FelzenszwalbTape)
+function record!(tape::FelzenszwalbTape, ΔS, ΔInt, t)
+    push!(tape.stack, FelzenszwalbStep(t, sparse(ΔS), sparsevec(ΔInt)))
+end
+
+function apply!(S::Segmentation, tape::FelzenszwalbTape)
     step = pop!(tape.stack)
-    I, J, V = findnz(step.δS)
-    S[CartesianIndex.(zip(I,J))] .-= V
+    I, J, V = findnz(step.ΔS)
+    S.S[CartesianIndex.(zip(I,J))] .-= V
+    I, V = findnz(step.ΔInt)
+    S.internal_diff[I] .-= V
     return step.t
 end
 
-struct Segmentation
-    S::Matrix{Float64}
-    internal_diff::Vector{Float64}
-    segment_size::Vector{Float64}
-end
 
-Segmentation(N::Int) = Segmentation(Matrix{Float64}(I,N,N), zeros(N), ones(N))
 
 function clear_intersections!(P, Vi, Ui)
     intersections = Vi ∩ Ui
@@ -182,7 +192,11 @@ function ChainRulesCore.rrule(::typeof(fillvec!), v, I, dI)
 end
 
 
-function f(S, internal_diff, segment_size, t, w, E, tape=nothing)
+function f(S::Segmentation, t, w, E, tape=nothing)
+    internal_diff = S.internal_diff
+    segment_size = S.segment_size
+    S = S.S
+
     weight = w[t]
     v, u = E[t]
     Vi = findall(x -> x > 0.0, S[v, :])
@@ -199,9 +213,6 @@ function f(S, internal_diff, segment_size, t, w, E, tape=nothing)
     adjust_v!(dV, v)
 
     dS = make_dS(dV, Vi, -dU, Ui)
-    if tape !== nothing
-        record!(tape, dS, t)
-    end
 
     Mi = sum(P, dims=1)'
     internal_diff_offset = zeros(size(S)[1])
@@ -215,6 +226,10 @@ function f(S, internal_diff, segment_size, t, w, E, tape=nothing)
         Vi, 
         [sum(col .* segment_size[Ui]) for col in eachcol(P)]
     )
+    
+    if tape !== nothing
+        record!(tape, dS, internal_diff_offset, t)
+    end
 
     return dS, internal_diff_offset, segment_size_offset
 end
@@ -230,26 +245,21 @@ function felzenszwalb_solve(G::GNNGraph)
     src, dst = src[edge_order], dst[edge_order]    
     E = collect(zip(src, dst))
 
-    num_nodes = N = G.num_nodes
-    num_segments = num_nodes 
-    S = Matrix{Float64}(I, num_nodes, num_segments)
-                        #  rows       cols
-    
-    internal_diff = zeros(Float64, N)
-    segment_size = ones(Float64, N)
+    N = G.num_nodes
+    S = Segmentation(N)
 
     tape = FelzenszwalbTape()
 
     for t in 1:length(E)
-        dS, internal_diff_offset, segment_size_offset = f(S, internal_diff, segment_size, t, w, E, tape)
-        S += dS
-        internal_diff += internal_diff_offset
-        segment_size += segment_size_offset
+        dS, internal_diff_offset, segment_size_offset = f(S, t, w, E, tape)
+        S.S += dS
+        S.internal_diff += internal_diff_offset
+        S.segment_size += segment_size_offset
         if t % 100 == 0
             println("Iteration $t/$(length(E))")
         end
     end
-    return Segmentation(S, internal_diff, segment_size), tape
+    return S, tape
 end
 
 function felzenszwalb_reverse(
@@ -263,27 +273,29 @@ function felzenszwalb_reverse(
     w = mean(sqrt.((G.x[:, src] .- G.x[:, dst]) .^ 2), dims=1)
     edge_order = sortperm(w, dims=2)
     w = w[edge_order]
+    Δw = zeros(size(w))
 
     src, dst = src[edge_order], dst[edge_order]    
     E = collect(zip(src, dst))
-
-    num_nodes = N = G.num_nodes
-    num_segments = num_nodes 
      
     t = length(E) 
-    while t > 1 
-        # S(t-1) = S(t) - δS(t)
-        t = apply!(S.S, tape)
-        δS, _, _, δt, δw, _, _ = gradient(
+    while !isempty(tape) 
+        t = apply!(S, tape)
+        print(t)
+        _, _, _, δt, δw, _, _ = gradient(
             f, 
-            S.S,
-            S.internal_diff,
-            S.segment_size,
+            S,
             t,
             w,
             E
         )
+        Δw .+= -ΔS' * δw
+        ΔS .+= -ΔS' * δt
     end
 
-
+    return Δw
 end
+
+S, tape = felzenszwalb_solve(G)
+ΔS = Matrix{Float64}(I, G.num_nodes, G.num_nodes)
+Δw = felzenszwalb_reverse(G, S, tape, ΔS)
