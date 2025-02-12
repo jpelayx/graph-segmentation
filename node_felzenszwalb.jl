@@ -8,6 +8,8 @@ using Zygote: @adjoint
 using GraphNeuralNetworks
 using NNlib: σ, tanh, tanh_fast, relu
 using LinearAlgebra
+using SparseArrays
+using DataStructures: Stack, pop!, push! 
 
 """
 d/dt h(t) = f(h(t), t, θ)
@@ -19,6 +21,36 @@ k = 25.0
 min_prob = 1e-2
 
 include("evaluate.jl")
+
+struct FelzenszwalbStep 
+    t::Int
+    δS::SparseMatrixCSC{Float64, Int}
+end 
+
+struct FelzenszwalbTape 
+    stack::Stack{FelzenszwalbStep}   
+end
+
+FelzenszwalbTape() = FelzenszwalbTape(Stack{FelzenszwalbStep}())
+
+function record!(tape::FelzenszwalbTape, δS, t)
+    push!(tape.stack, FelzenszwalbStep(t, sparse(δS)))
+end
+
+function apply!(S, tape::FelzenszwalbTape)
+    step = pop!(tape.stack)
+    I, J, V = findnz(step.δS)
+    S[CartesianIndex.(zip(I,J))] .-= V
+    return step.t
+end
+
+struct Segmentation
+    S::Matrix{Float64}
+    internal_diff::Vector{Float64}
+    segment_size::Vector{Float64}
+end
+
+Segmentation(N::Int) = Segmentation(Matrix{Float64}(I,N,N), zeros(N), ones(N))
 
 function clear_intersections!(P, Vi, Ui)
     intersections = Vi ∩ Ui
@@ -150,7 +182,7 @@ function ChainRulesCore.rrule(::typeof(fillvec!), v, I, dI)
 end
 
 
-function f(S, internal_diff, segment_size, t, w, E)
+function f(S, internal_diff, segment_size, t, w, E, tape=nothing)
     weight = w[t]
     v, u = E[t]
     Vi = findall(x -> x > 0.0, S[v, :])
@@ -167,6 +199,9 @@ function f(S, internal_diff, segment_size, t, w, E)
     adjust_v!(dV, v)
 
     dS = make_dS(dV, Vi, -dU, Ui)
+    if tape !== nothing
+        record!(tape, dS, t)
+    end
 
     Mi = sum(P, dims=1)'
     internal_diff_offset = zeros(size(S)[1])
@@ -203,8 +238,10 @@ function felzenszwalb_solve(G::GNNGraph)
     internal_diff = zeros(Float64, N)
     segment_size = ones(Float64, N)
 
+    tape = FelzenszwalbTape()
+
     for t in 1:length(E)
-        dS, internal_diff_offset, segment_size_offset = f(S, internal_diff, segment_size, t, w, E)
+        dS, internal_diff_offset, segment_size_offset = f(S, internal_diff, segment_size, t, w, E, tape)
         S += dS
         internal_diff += internal_diff_offset
         segment_size += segment_size_offset
@@ -212,14 +249,19 @@ function felzenszwalb_solve(G::GNNGraph)
             println("Iteration $t/$(length(E))")
         end
     end
-    return S
+    return Segmentation(S, internal_diff, segment_size), tape
 end
 
-function felzenszwalb_reverse(G::GNNGraph, S, Δf)
+function felzenszwalb_reverse(
+    G::GNNGraph,
+    S::Segmentation, 
+    tape::FelzenszwalbTape,
+    ΔS::Matrix{Float64} 
+)
     src, dst = edge_index(G)
     
     w = mean(sqrt.((G.x[:, src] .- G.x[:, dst]) .^ 2), dims=1)
-    edge_order = sortperm(w, rev=true, dims=2)
+    edge_order = sortperm(w, dims=2)
     w = w[edge_order]
 
     src, dst = src[edge_order], dst[edge_order]    
@@ -227,18 +269,21 @@ function felzenszwalb_reverse(G::GNNGraph, S, Δf)
 
     num_nodes = N = G.num_nodes
     num_segments = num_nodes 
+     
+    t = length(E) 
+    while t > 1 
+        # S(t-1) = S(t) - δS(t)
+        t = apply!(S.S, tape)
+        δS, _, _, δt, δw, _, _ = gradient(
+            f, 
+            S.S,
+            S.internal_diff,
+            S.segment_size,
+            t,
+            w,
+            E
+        )
+    end
 
-end
 
-
-function step!(S, internal_diff, segment_size, t)
-    dS, internal_diff_offset, segment_size_offset = f(S, internal_diff, segment_size, t, w, E)
-    S += dS
-    internal_diff += internal_diff_offset
-    segment_size += segment_size_offset
-    
-    @assert all(sum(eachcol(S)) .≈ 1.0)
-    
-
-    return S, internal_diff, segment_size, t+1
 end
