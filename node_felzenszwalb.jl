@@ -41,9 +41,13 @@ struct FelzenszwalbStep
     ΔInt::SparseVector{Float64, Int}
 end 
 
+@adapt_structure FelzenszwalbStep
+
 struct FelzenszwalbTape 
     stack::Stack{FelzenszwalbStep}   
 end
+
+@adapt_structure FelzenszwalbTape
 
 FelzenszwalbTape() = FelzenszwalbTape(Stack{FelzenszwalbStep}())
 
@@ -313,5 +317,6 @@ end
 
 cG = G |> cu
 S, tape = felzenszwalb_solve(cG)
+N, _ = size(S.S)
 ∇ = (rand(N,N) |> cu, rand(N) |> cu, nothing) 
 Δw = felzenszwalb_reverse(cG, S, tape, ∇)
