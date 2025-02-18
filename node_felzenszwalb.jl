@@ -10,6 +10,9 @@ using NNlib: σ, tanh, tanh_fast, relu
 using LinearAlgebra
 using SparseArrays
 using DataStructures: Stack, pop!, push! 
+using CUDA
+using Flux
+using Adapt: @adapt_structure
 
 """
 d/dt h(t) = f(h(t), t, θ)
@@ -27,6 +30,8 @@ mutable struct Segmentation
     internal_diff::Vector{Float64}
     segment_size::Vector{Float64}
 end
+
+@adapt_structure Segmentation
 
 Segmentation(N::Int) = Segmentation(Matrix{Float64}(I,N,N), zeros(N), ones(N))
 
@@ -48,7 +53,12 @@ function Base.isempty(tape::FelzenszwalbTape)
 end
 
 function record!(tape::FelzenszwalbTape, ΔS, ΔInt, t)
-    push!(tape.stack, FelzenszwalbStep(t, sparse(ΔS), sparsevec(ΔInt)))
+    ΔInt = sparsevec(ΔInt)
+    if isempty(ΔInt.nzval)
+        return 
+    end 
+    ΔS = sparse(ΔS)
+    push!(tape.stack, FelzenszwalbStep(t, ΔS, ΔInt))
 end
 
 function apply!(S::Segmentation, tape::FelzenszwalbTape)
@@ -227,7 +237,7 @@ function f(S::Segmentation, t, w, E, tape=nothing)
         [sum(col .* segment_size[Ui]) for col in eachcol(P)]
     )
     
-    if tape !== nothing
+    @ignore_derivatives if tape !== nothing
         record!(tape, dS, internal_diff_offset, t)
     end
 
@@ -266,36 +276,42 @@ function felzenszwalb_reverse(
     G::GNNGraph,
     S::Segmentation, 
     tape::FelzenszwalbTape,
-    ΔS::Matrix{Float64} 
+    ∇::Any
 )
+    G = cG
     src, dst = edge_index(G)
     
     w = mean(sqrt.((G.x[:, src] .- G.x[:, dst]) .^ 2), dims=1)
     edge_order = sortperm(w, dims=2)
     w = w[edge_order]
-    Δw = zeros(size(w))
+    Δw = zeros(size(w)) |> cu
 
     src, dst = src[edge_order], dst[edge_order]    
     E = collect(zip(src, dst))
      
     t = length(E) 
+    ∇S, ∇Int, _ = ∇
     while !isempty(tape) 
         t = apply!(S, tape)
         print(t)
-        _, _, _, δt, δw, _, _ = gradient(
-            f, 
-            S,
-            t,
-            w,
-            E
-        )
-        Δw .+= -ΔS' * δw
-        ΔS .+= -ΔS' * δt
+        _, back = pullback(f, S, t, w, E)
+        δS,_, δw, _   = back(∇)
+        Δw .+= -δw
+        δS, δInt, _ = δS.x
+        ∇S .+= -δS
+        ∇Int .+= -δInt
+        ∇ = (∇S, ∇Int, nothing)
     end
 
     return Δw
 end
 
-S, tape = felzenszwalb_solve(G)
-ΔS = Matrix{Float64}(I, G.num_nodes, G.num_nodes)
-Δw = felzenszwalb_reverse(G, S, tape, ΔS)
+function compute_edge_weights(x, edge_index)
+    w = sum(sqrt.((x[:, edge_index[1]] .- x[:, edge_index[2]]) .^ 2), dims=1)./ndims(x)
+    return w
+end
+
+cG = G |> cu
+S, tape = felzenszwalb_solve(cG)
+∇ = (rand(N,N) |> cu, rand(N) |> cu, nothing) 
+Δw = felzenszwalb_reverse(cG, S, tape, ∇)
