@@ -10,9 +10,7 @@ using NNlib: σ, tanh, tanh_fast, relu
 using LinearAlgebra
 using SparseArrays
 using DataStructures: Stack, pop!, push! 
-using CUDA
 using Flux
-using Adapt: @adapt_structure
 
 """
 d/dt h(t) = f(h(t), t, θ)
@@ -30,8 +28,6 @@ mutable struct Segmentation
     internal_diff::Vector{Float64}
     segment_size::Vector{Float64}
 end
-
-@adapt_structure Segmentation
 
 Segmentation(N::Int) = Segmentation(Matrix{Float64}(I,N,N), zeros(N), ones(N))
 
@@ -278,13 +274,12 @@ function felzenszwalb_reverse(
     tape::FelzenszwalbTape,
     ∇::Any
 )
-    G = cG
     src, dst = edge_index(G)
     
     w = mean(sqrt.((G.x[:, src] .- G.x[:, dst]) .^ 2), dims=1)
     edge_order = sortperm(w, dims=2)
     w = w[edge_order]
-    Δw = zeros(size(w)) |> cu
+    Δw = zeros(size(w))
 
     src, dst = src[edge_order], dst[edge_order]    
     E = collect(zip(src, dst))
@@ -311,7 +306,7 @@ function compute_edge_weights(x, edge_index)
     return w
 end
 
-cG = G |> cu
-S, tape = felzenszwalb_solve(cG)
-∇ = (rand(N,N) |> cu, rand(N) |> cu, nothing) 
-Δw = felzenszwalb_reverse(cG, S, tape, ∇)
+N = G.num_nodes
+S, tape = felzenszwalb_solve(G)
+∇ = (rand(N,N), rand(N), nothing) 
+Δw = felzenszwalb_reverse(G, S, tape, ∇)
