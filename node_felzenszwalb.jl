@@ -19,7 +19,7 @@ h(t+1) = h(t) + 1 * f(h(t), t, θ)
 
 k = 25.0
 μ = 3.0
-min_prob = 1e-2
+min_prob = 1e-10
 
 include("evaluate.jl")
 
@@ -205,12 +205,15 @@ function f(S::Segmentation, t, w, E, tape=nothing)
 
     weight = w[t]
     v, u = E[t]
-    Vi = findall(x -> x > 0.0, S[v, :])
-    Ui = findall(x -> x > 0.0, S[u, :])
+    Vi = findall(x -> x > min_prob, S[v, :])
+    Ui = findall(x -> x > min_prob, S[u, :])
     V = @view S[:, Vi]
     U = @view S[:, Ui]
 
     P = merge_probability(Vi, V, Ui, U, internal_diff, segment_size, v, u, weight)
+    @ignore_derivatives if !any(p -> p > 0.0, P)
+        return nothing, nothing, nothing
+    end    
     
     dU = U * Diagonal(vec(sum(P, dims=2)))
     adjust_u!(dU, U, u)
@@ -258,6 +261,9 @@ function felzenszwalb_solve(G::GNNGraph)
 
     for t in 1:length(E)
         dS, internal_diff_offset, segment_size_offset = f(S, t, w, E, tape)
+        if dS === nothing
+            continue
+        end
         S.S += dS
         S.internal_diff += internal_diff_offset
         S.segment_size += segment_size_offset
@@ -279,26 +285,27 @@ function felzenszwalb_reverse(
     w = mean(sqrt.((G.x[:, src] .- G.x[:, dst]) .^ 2), dims=1)
     edge_order = sortperm(w, dims=2)
     w = w[edge_order]
-    Δw = zeros(size(w))
+    ∇w = zeros(size(w))
 
     src, dst = src[edge_order], dst[edge_order]    
     E = collect(zip(src, dst))
      
     t = length(E) 
-    ∇S, ∇Int, _ = ∇
+    ∇S, _, _ = ∇
+    ∇Int = zeros(size(S.internal_diff))
     while !isempty(tape) 
         t = apply!(S, tape)
-        print(t)
         _, back = pullback(f, S, t, w, E)
-        δS,_, δw, _   = back(∇)
-        Δw .+= -δw
+        δS,_, δw, _   = back((∇S, ∇Int, nothing))
+        ∇w .+= -δw
         δS, δInt, _ = δS.x
         ∇S .+= -δS
         ∇Int .+= -δInt
-        ∇ = (∇S, ∇Int, nothing)
+        if t % 100 == 0
+            println("Iteration $t/$(length(E))")
+        end
     end
-
-    return Δw
+    return ∇w
 end
 
 function compute_edge_weights(x, edge_index)
@@ -306,7 +313,27 @@ function compute_edge_weights(x, edge_index)
     return w
 end
 
+function apply_segmentation(S::Segmentation, G::GNNGraph; node_tol=0, edge_tol=0)
+    s = S.S 
+    s = s[:, vec(sum(s, dims=1) .> node_tol)]
+    X =  G.x * s
+    A = sparse(s' * adjacency_matrix(G) * s)
+    droptol!(A, edge_tol)
+    new_G = GNNGraph(A)
+    new_G.ndata.x = X
+    return new_G
+end
+
 N = G.num_nodes
 S, tape = felzenszwalb_solve(G)
-∇ = (rand(N,N), rand(N), nothing) 
-Δw = felzenszwalb_reverse(G, S, tape, ∇)
+∇ = (rand(N,N), nothing, nothing) 
+dw = felzenszwalb_reverse(G, S, tape, ∇)
+
+s = S.S
+tol = 1e-5
+s = s[:, vec(sum(s, dims=1) .> tol)]
+X =  G.x * s
+A = sparse(s' * adjacency_matrix(G) * s)
+droptol!(A, tol)
+
+gg = apply_segmentation(S, G, edge_tol=1e-5)
